@@ -20,7 +20,16 @@ import org.hibernate.Transaction;
 import org.hibernate.cfg.AvailableSettings;
 import org.hibernate.cfg.Configuration;
 import org.hibernate.testing.junit4.BaseCoreFunctionalTestCase;
+import org.junit.Assert;
 import org.junit.Test;
+
+import java.io.PrintWriter;
+import java.io.StringWriter;
+import java.util.UUID;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * This template demonstrates how to develop a test case for Hibernate ORM, using its built-in unit test framework.
@@ -37,8 +46,9 @@ public class ORMUnitTestCase extends BaseCoreFunctionalTestCase {
 	@Override
 	protected Class[] getAnnotatedClasses() {
 		return new Class[] {
-//				Foo.class,
-//				Bar.class
+				Shop.class,
+				ShopTaxAssociation.class,
+				Tracking.class,
 		};
 	}
 
@@ -66,14 +76,77 @@ public class ORMUnitTestCase extends BaseCoreFunctionalTestCase {
 		//configuration.setProperty( AvailableSettings.GENERATE_STATISTICS, "true" );
 	}
 
+	public static final ReentrantLock LOCK = new ReentrantLock();
+
 	// Add your tests, using standard JUnit.
 	@Test
-	public void hhh123Test() throws Exception {
-		// BaseCoreFunctionalTestCase automatically creates the SessionFactory and provides the Session.
-		Session s = openSession();
-		Transaction tx = s.beginTransaction();
-		// Do stuff...
-		tx.commit();
-		s.close();
+	public void hhh18475Test() throws Exception {
+		long trackingId = 2L;
+		// init the data
+		// not sure about the details, it seems we need three entities
+		// one case that triggers the bug is: entity1 references entity2, and entity2 has a collection of entity3 with eager fetching
+			try (Session s = openSession()) {
+			Transaction tx = s.beginTransaction();
+			Shop shop = new Shop();
+			shop.setId(1L);
+			ShopTaxAssociation shopTaxAssociation = new ShopTaxAssociation(shop, UUID.randomUUID());
+			shop.getShopTaxAssociations().add(shopTaxAssociation);
+			session.save(shop);
+
+			Tracking offerImportTracking = new Tracking();
+			offerImportTracking.setId(trackingId);
+			offerImportTracking.setShop(shop);
+			session.save(offerImportTracking);
+
+			tx.commit();
+		}
+
+		ExecutorService executorService = Executors.newFixedThreadPool(2);
+
+		LOCK.lock();
+		try {
+			executorService.submit(() -> {
+				try (Session session = openSession()) {
+					Tracking tracking = session.load(Tracking.class, trackingId);
+					tracking.getShop();
+				}
+			});
+			// wait for the thread to be stuck at the right point
+			// if reproducing with a debugger, remove this loop
+			while (!LOCK.hasQueuedThreads()) {
+				try {
+					Thread.sleep(10);
+				} catch (InterruptedException e) {
+					throw new RuntimeException(e);
+				}
+			}
+
+			// run another Callable to trigger the issue
+			Future<?> future = executorService.submit(() -> {
+				try (Session session2 = openSession()) {
+					Tracking tracking = session2.load(Tracking.class, trackingId);
+					tracking.getShop();
+				}
+			});
+
+			try {
+				future.get();
+				Assert.fail("future should contain an exception");
+			} catch (Exception e) {
+				// using getCause() to unwrap the ExecutionException
+				Assert.assertEquals(e.getCause().getClass(), NullPointerException.class);
+				StringWriter out = new StringWriter();
+				try (PrintWriter printWriter = new PrintWriter(out)) {
+					e.getCause().printStackTrace(printWriter);
+				}
+				Assert.assertTrue(out.toString().startsWith("java.lang.NullPointerException: Cannot invoke \"org.hibernate.loader.plan.exec.process.spi.EntityReferenceInitializer.getEntityReference()\" because \"entityReferenceInitializer\" is null\n" +
+															"\tat org.hibernate.loader.plan.exec.process.internal.AbstractRowReader.resolveEntityKey(AbstractRowReader.java:105)\n" +
+															"\tat org.hibernate.loader.plan.exec.process.internal.AbstractRowReader.resolveEntityKey(AbstractRowReader.java:121)\n" +
+															"\tat org.hibernate.loader.plan.exec.process.internal.AbstractRowReader.resolveEntityKey(AbstractRowReader.java:109)\n" +
+															"\tat org.hibernate.loader.plan.exec.process.internal.AbstractRowReader.readRow(AbstractRowReader.java:72)"));
+			}
+		} finally {
+			LOCK.unlock();
+		}
 	}
 }
